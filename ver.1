@@ -1,0 +1,138 @@
+**Puppeteer Scraper**
+
+**Glob Patterns**
+
+https://music.apple.com/cn/artist/*/see-all*
+
+https://music.apple.com/cn/album/*
+
+**Page function**
+async function pageFunction(context) {
+    const { request, log, page, enqueueLinks, parseWithCheerio } = context;
+    const url = request.url;
+
+    // =================================================================
+    //  阶段1: 列表页 (已成功, 勿动)
+    // =================================================================
+    if (url.includes('/artist/')) {
+        log.info(`[列表页] 正在扫描: ${url}`);
+        try {
+            await page.waitForSelector('a.product-lockup__link', { timeout: 20000 });
+            log.info('[列表页] 专辑链接已加载, 开始添加所有链接到队列...');
+            await enqueueLinks({
+                selector: 'a.product-lockup__link',
+                userData: { label: 'DETAIL' },
+            });
+            log.info('[列表页] 扫描完成, 成功将专辑链接加入队列。');
+        } catch (error) {
+            log.warning(`[列表页] 在页面 ${url} 上加载专辑列表或添加链接失败: ${error.message}`);
+        }
+        return;
+    }
+
+    // =================================================================
+    //  阶段2: 详情页 (增加新字段)
+    // =================================================================
+    if (url.includes('/album/')) {
+        log.info(`[详情页] --- 开始处理: ${url} ---`);
+        try {
+            await page.waitForSelector('div.container-detail-header', { timeout: 15000 });
+            
+            const $ = await parseWithCheerio();
+
+            const albumTitle = $('h1.headings__title span[dir="auto"]').text().trim();
+            if (!albumTitle) {
+                log.warning('[详情页] 未能提取到专辑标题，跳过。');
+                return;
+            }
+            const artists = [];
+            $('div.headings__subtitles a').each(function() {
+                artists.push($(this).text().trim());
+            });
+            const artist = artists.join(' & ');
+            let albumType = 'LP';
+            const lowerCaseTitle = albumTitle.toLowerCase();
+            if (lowerCaseTitle.endsWith(' - single')) {
+                albumType = 'Single';
+            } else if (lowerCaseTitle.endsWith(' - ep')) {
+                albumType = 'EP';
+            }
+            const commercialKeywords = ['原声带', 'live', '演唱会', '主题曲', '配乐', '电影', '游戏', '广告', '电视剧', 'soundtrack'];
+            let isCommercial = false;
+            for (const keyword of commercialKeywords) {
+                if (lowerCaseTitle.includes(keyword)) {
+                    isCommercial = true;
+                    break;
+                }
+            }
+
+            // --- 数据提取增强 ---
+            let releaseYear = '未知';
+            let albumDuration = '未知';
+            // 新增：初始化发行日期和版权信息变量
+            let releaseDate = '未知';
+            let copyrightInfo = '未知';
+
+            const footerText = $('p[data-testid="tracklist-footer-description"]').text();
+            if (footerText) {
+                // 提取年份 (保持不变)
+                const yearMatch = footerText.match(/\d{4}/);
+                if (yearMatch) {
+                    releaseYear = yearMatch[0];
+                }
+
+                // 提取总时长 (保持不变)
+                const durationMatch = footerText.match(/\d+\s*分钟|\d+\s*hours?,\s*\d+\s*minutes?/);
+                 if (durationMatch) {
+                    albumDuration = durationMatch[0].trim();
+                }
+
+                // 新增：使用正则表达式提取完整的发行日期
+                const dateMatch = footerText.match(/\d{4}年\d{1,2}月\d{1,2}日/);
+                if (dateMatch) {
+                    releaseDate = dateMatch[0];
+                }
+
+                // 新增：使用正则表达式提取版权信息
+                const copyrightMatch = footerText.match(/℗\s*.+/);
+                if (copyrightMatch) {
+                    copyrightInfo = copyrightMatch[0].trim();
+                }
+            }
+
+            const trackList = [];
+            $('div.songs-list-row__song-container').each(function() {
+                const songTitle = $(this).find('div[data-testid="track-title"]').text().trim();
+                const songDuration = $(this).find('time[data-testid="track-duration"]').attr('datetime');
+                if (songTitle && songDuration) {
+                     const formattedDuration = songDuration
+                        .replace('PT', '')
+                        .replace('M', ':')
+                        .replace('S', '');
+                    trackList.push({
+                        songTitle: songTitle,
+                        songDuration: formattedDuration
+                    });
+                }
+            });
+            log.info(`[详情页] ✅ 成功提取: 【${albumTitle}】`);
+
+            // 在返回的数据中加入新的字段
+            return {
+                albumTitle: albumTitle.replace(/ - Single$/, '').replace(/ - EP$/, ''),
+                artist: artist,
+                albumType: albumType,
+                releaseYear: releaseYear,
+                releaseDate: releaseDate,       // 新增字段
+                copyrightInfo: copyrightInfo,   // 新增字段
+                isCommercial: isCommercial,
+                albumDuration: albumDuration,
+                trackList: trackList,
+                albumUrl: url
+            };
+
+        } catch (error) {
+            log.warning(`[详情页] 处理页面 ${url} 失败: ${error.message}`);
+        }
+    }
+}
