@@ -1,0 +1,130 @@
+**Puppeteer Scraper**
+
+**Glob Patterns**
+
+https://music.apple.com/cn/artist/*/see-all*
+
+https://music.apple.com/cn/album/*
+async function pageFunction(context) {
+    // 关键修正：将 enqueueLinks 添加回工具列表
+    const { request, log, page, crawler, enqueueLinks, parseWithCheerio } = context;
+    const url = request.url;
+    const label = request.userData.label;
+
+    // =================================================================
+    //  阶段1: 歌手主页 (已成功, 勿动)
+    // =================================================================
+    if (url.includes('/artist/') && !label) {
+        log.info(`[歌手主页] 正在处理: ${url}`);
+        const cleanBaseUrl = url.split('?')[0].split('#')[0];
+        const fullAlbumsUrl = `${cleanBaseUrl}/see-all?section=full-albums`;
+        const singlesUrl = `${cleanBaseUrl}/see-all?section=singles`;
+
+        log.info(`[歌手主页] 手动添加列表页链接到队列: ${fullAlbumsUrl}`);
+        log.info(`[歌手主页] 手动添加列表页链接到队列: ${singlesUrl}`);
+        
+        await crawler.addRequests([
+            { url: fullAlbumsUrl, userData: { label: 'LIST' } },
+            { url: singlesUrl, userData: { label: 'LIST' } },
+        ]);
+        
+        log.info('[歌手主页] 已将 "专辑" 与 "单曲" 列表页加入队列。');
+        return;
+    }
+    
+    // =================================================================
+    //  阶段2: "显示全部" 列表页 (现在可以找到 enqueueLinks 了)
+    // =================================================================
+    if (label === 'LIST' || url.includes('/see-all')) {
+        log.info(`[列表页] 正在扫描: ${url}`);
+        try {
+            await page.waitForSelector('a.product-lockup__link', { timeout: 20000 });
+            log.info('[列表页] 列表页加载成功，开始收集所有专辑链接...');
+
+            await enqueueLinks({
+                selector: 'a.product-lockup__link',
+                userData: { label: 'DETAIL' },
+            });
+            log.info('[列表页] 成功将所有专辑链接加入队列。');
+
+        } catch (error) {
+             log.warning(`[列表页] 在页面 ${url} 上收集专辑链接失败: ${error.message}`);
+        }
+        return;
+    }
+
+    // =================================================================
+    //  阶段3: 专辑详情页 (已成功, 勿动)
+    // =================================================================
+    if (label === 'DETAIL' || url.includes('/album/')) {
+        log.info(`[详情页] --- 开始处理: ${url} ---`);
+        try {
+            await page.waitForSelector('div.container-detail-header', { timeout: 15000 });
+            const $ = await parseWithCheerio();
+            const albumTitle = $('h1.headings__title span[dir="auto"]').text().trim();
+            if (!albumTitle) {
+                log.warning('[详情页] 未能提取到专辑标题，跳过。');
+                return;
+            }
+            const artists = [];
+            $('div.headings__subtitles a').each(function() {
+                artists.push($(this).text().trim());
+            });
+            const artist = artists.join(' & ');
+            let albumType = 'LP';
+            const lowerCaseTitle = albumTitle.toLowerCase();
+            if (lowerCaseTitle.endsWith(' - single')) {
+                albumType = 'Single';
+            } else if (lowerCaseTitle.endsWith(' - ep')) {
+                albumType = 'EP';
+            }
+            const commercialKeywords = ['原声带', 'live', '演唱会', '主题曲', '配乐', '电影', '游戏', '广告', '电视剧', 'soundtrack'];
+            let isCommercial = false;
+            for (const keyword of commercialKeywords) {
+                if (lowerCaseTitle.includes(keyword)) {
+                    isCommercial = true;
+                    break;
+                }
+            }
+            let releaseYear = '未知';
+            let albumDuration = '未知';
+            let releaseDate = '未知';
+            let copyrightInfo = '未知';
+            const footerText = $('p[data-testid="tracklist-footer-description"]').text();
+            if (footerText) {
+                const yearMatch = footerText.match(/\d{4}/);
+                if (yearMatch) { releaseYear = yearMatch[0]; }
+                const durationMatch = footerText.match(/\d+\s*小时\s*\d+\s*分钟|\d+\s*分钟|\d+\s*hours?,\s*\d+\s*minutes?/);
+                 if (durationMatch) { albumDuration = durationMatch[0].trim(); }
+                const dateMatch = footerText.match(/\d{4}年\d{1,2}月\d{1,2}日/);
+                if (dateMatch) { releaseDate = dateMatch[0]; }
+                const copyrightMatch = footerText.match(/℗\s*.+/);
+                if (copyrightMatch) { copyrightInfo = copyrightMatch[0].trim(); }
+            }
+            const trackList = [];
+            $('div[data-testid="track-list-item"]').each(function() {
+                const songTitle = $(this).find('div[data-testid="track-title"]').text().trim();
+                const songDuration = $(this).find('time[data-testid="track-duration"]').attr('datetime');
+                if (songTitle && songDuration) {
+                     const formattedDuration = songDuration.replace('PT', '').replace('M', ':').replace('S', '');
+                    trackList.push({ songTitle: songTitle, songDuration: formattedDuration });
+                }
+            });
+            log.info(`[详情页] ✅ 成功提取: 【${albumTitle}】`);
+            return {
+                albumTitle: albumTitle.replace(/ - Single$/, '').replace(/ - EP$/, ''),
+                artist: artist,
+                albumType: albumType,
+                releaseYear: releaseYear,
+                releaseDate: releaseDate,
+                copyrightInfo: copyrightInfo,
+                isCommercial: isCommercial,
+                albumDuration: albumDuration,
+                trackList: trackList,
+                albumUrl: url
+            };
+        } catch (error) {
+            log.warning(`[详情页] 处理页面 ${url} 失败: ${error.message}`);
+        }
+    }
+}
